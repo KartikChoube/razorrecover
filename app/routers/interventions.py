@@ -139,16 +139,37 @@ async def process_due_retries(
     """
     try:
         jobs = await retry_queue.get_due_jobs()
+
+        # For demo/batch execution: also retrieve any pending AUTO_RETRY interventions in the DB
+        seen_tx_ids = {UUID(j["transaction_id"]) for j in jobs if j.get("transaction_id")}
+        pending_stmt = (
+            select(Intervention)
+            .where(
+                Intervention.intervention_type == InterventionType.AUTO_RETRY,
+                Intervention.status == InterventionStatus.PENDING,
+            )
+        )
+        pending_interventions = (await session.execute(pending_stmt)).scalars().all()
+        for inv in pending_interventions:
+            if inv.transaction_id not in seen_tx_ids:
+                jobs.append({
+                    "transaction_id": str(inv.transaction_id),
+                    "intervention_id": inv.id,
+                    "_raw_payload": None,
+                })
+                seen_tx_ids.add(inv.transaction_id)
+
         counts = {"processed": 0, "succeeded": 0, "failed": 0, "escalated": 0}
 
         for job in jobs:
             try:
                 tx_id_str = job.get("transaction_id")
                 inv_id = job.get("intervention_id")
-                raw_payload = job.get("_raw_payload", "")
+                raw_payload = job.get("_raw_payload")
 
                 if not tx_id_str or not inv_id:
-                    await retry_queue.remove_job(raw_payload)
+                    if raw_payload:
+                        await retry_queue.remove_job(raw_payload)
                     continue
 
                 tx_id = UUID(tx_id_str)
@@ -165,7 +186,8 @@ async def process_due_retries(
                 intervention = inv_result.scalar_one_or_none()
 
                 if not transaction or not intervention:
-                    await retry_queue.remove_job(raw_payload)
+                    if raw_payload:
+                        await retry_queue.remove_job(raw_payload)
                     continue
 
                 # Execute the retry
@@ -175,7 +197,8 @@ async def process_due_retries(
                 counts["processed"] += 1
 
                 # Remove the completed job from Redis
-                await retry_queue.remove_job(raw_payload)
+                if raw_payload:
+                    await retry_queue.remove_job(raw_payload)
 
                 if retry_result.get("status") == "succeeded":
                     counts["succeeded"] += 1

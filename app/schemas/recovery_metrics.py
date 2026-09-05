@@ -9,11 +9,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class RecoveryMetricsBase(BaseModel):
     """Base schema for recovery metrics."""
-    total_transactions: int
-    total_failed: int
-    revenue_at_risk: Decimal
-    revenue_recovered: Decimal = Field(default=Decimal(0))
-    recovery_rate: float = Field(default=0.0, ge=0, le=1)
+    total_transactions: int = 0
+    total_failed: int = 0
+    revenue_at_risk: Decimal = Field(default=Decimal("0.0"))
+    revenue_recovered: Decimal = Field(default=Decimal("0.0"))
+    recovery_rate: float = Field(default=0.0, ge=0.0, le=100.0)
 
 class RecoveryMetricsCreate(RecoveryMetricsBase):
     """Schema for creating recovery metrics."""

@@ -28,7 +28,13 @@ class FailureClassification(Base):
         index=True,
     )
     predicted_reason: Mapped[FailureReasonType] = mapped_column(
-        SQLAlchemyEnum(FailureReasonType, name="failure_reason_type", create_constraint=True, native_enum=True),
+        SQLAlchemyEnum(
+            FailureReasonType,
+            name="failure_reason_type",
+            create_constraint=True,
+            native_enum=True,
+            values_callable=lambda enum_cls: [e.value for e in enum_cls],
+        ),
         nullable=False,
     )
     confidence_score: Mapped[float] = mapped_column(Float, nullable=False)

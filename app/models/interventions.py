@@ -28,14 +28,26 @@ class Intervention(Base):
         index=True,
     )
     intervention_type: Mapped[InterventionType] = mapped_column(
-        SQLAlchemyEnum(InterventionType, name="intervention_type", create_constraint=True, native_enum=True),
+        SQLAlchemyEnum(
+            InterventionType,
+            name="intervention_type",
+            create_constraint=True,
+            native_enum=True,
+            values_callable=lambda enum_cls: [e.value for e in enum_cls],
+        ),
         nullable=False,
     )
     policy_decision_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     max_retries: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[InterventionStatus] = mapped_column(
-        SQLAlchemyEnum(InterventionStatus, name="intervention_status", create_constraint=True, native_enum=True),
+        SQLAlchemyEnum(
+            InterventionStatus,
+            name="intervention_status",
+            create_constraint=True,
+            native_enum=True,
+            values_callable=lambda enum_cls: [e.value for e in enum_cls],
+        ),
         default=InterventionStatus.PENDING,
         server_default="pending",
         nullable=False,

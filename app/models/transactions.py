@@ -31,12 +31,24 @@ class Transaction(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), default="INR", server_default="INR")
     status: Mapped[TransactionStatus] = mapped_column(
-        SQLAlchemyEnum(TransactionStatus, name="transaction_status", create_constraint=True, native_enum=True),
+        SQLAlchemyEnum(
+            TransactionStatus,
+            name="transaction_status",
+            create_constraint=True,
+            native_enum=True,
+            values_callable=lambda enum_cls: [e.value for e in enum_cls],
+        ),
         nullable=False,
         index=True,
     )
     payment_method: Mapped[PaymentMethod] = mapped_column(
-        SQLAlchemyEnum(PaymentMethod, name="payment_method", create_constraint=True, native_enum=True),
+        SQLAlchemyEnum(
+            PaymentMethod,
+            name="payment_method",
+            create_constraint=True,
+            native_enum=True,
+            values_callable=lambda enum_cls: [e.value for e in enum_cls],
+        ),
         nullable=False,
     )
     failure_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)

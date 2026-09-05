@@ -9,7 +9,8 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/razorrecover"
     REDIS_URL: str = "redis://localhost:6379/0"
-    ANTHROPIC_API_KEY: str = ""
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL: str = "qwen/qwen3.8-27b"
     RAZORPAY_KEY_ID: str = ""
     RAZORPAY_KEY_SECRET: str = ""
     LOG_LEVEL: str = "INFO"

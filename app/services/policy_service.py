@@ -197,6 +197,11 @@ class PolicyService:
 
         # Decide policy
         decision = cls.decide_intervention(transaction, classification)
+        logger.info(
+            f"⚖️ Policy decision for tx {transaction_id} "
+            f"(amount=₹{transaction.amount}, reason={classification.predicted_reason}, "
+            f"conf={classification.confidence_score:.2f}) -> {decision.intervention_type.value}: {decision.reason}"
+        )
         
         # Create Intervention
         intervention = Intervention(

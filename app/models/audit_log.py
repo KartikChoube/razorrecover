@@ -30,7 +30,13 @@ class AuditLog(Base):
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
     event_details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     actor: Mapped[ActorType] = mapped_column(
-        SQLAlchemyEnum(ActorType, name="actor_type", create_constraint=True, native_enum=True),
+        SQLAlchemyEnum(
+            ActorType,
+            name="actor_type",
+            create_constraint=True,
+            native_enum=True,
+            values_callable=lambda enum_cls: [e.value for e in enum_cls],
+        ),
         default=ActorType.SYSTEM,
         server_default="system",
         nullable=False,

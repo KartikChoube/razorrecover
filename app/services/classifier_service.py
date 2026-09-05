@@ -1,4 +1,10 @@
-"""AI-powered payment failure classifier service."""
+"""AI-powered payment failure classifier service.
+
+Uses Groq's LLaMA 3.3 70B model (via the Groq Python SDK) for fast,
+free-tier inference to classify payment failure reasons from simulated
+gateway error codes. The classifier NEVER sees the ground-truth
+failure_reason — it only receives the error code and transaction context.
+"""
 from __future__ import annotations
 
 import json
@@ -7,9 +13,10 @@ import random
 import uuid
 from typing import Any
 
-import anthropic
+from groq import AsyncGroq, APITimeoutError, RateLimitError, APIConnectionError, APIStatusError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models.audit_log import AuditLog
 from app.models.enums import ActorType, TransactionStatus
 from app.models.failure_classifications import FailureClassification
@@ -63,7 +70,7 @@ def generate_simulated_error_code(failure_reason: str) -> tuple[str, str, bool]:
 
 
 class ClassifierService:
-    """AI-powered payment failure classifier using Anthropic Claude.
+    """AI-powered payment failure classifier using Groq (LLaMA 3.3 70B).
     
     Uses LLM to classify payment failure reasons from transaction metadata
     and simulated gateway error codes. The classifier NEVER sees the ground-truth
@@ -73,14 +80,14 @@ class ClassifierService:
     VALID_REASONS = {"insufficient_funds", "bank_error", "expired_card", "auth_failure", "unknown"}
     
     def __init__(self) -> None:
-        self._client: anthropic.AsyncAnthropic | None = None
+        self._client: AsyncGroq | None = None
     
     @property
-    def client(self) -> anthropic.AsyncAnthropic:
-        """Lazy load Anthropic client."""
+    def client(self) -> AsyncGroq:
+        """Lazy load Groq client."""
         if self._client is None:
             from app.config import settings
-            self._client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+            self._client = AsyncGroq(api_key=settings.GROQ_API_KEY)
         return self._client
         
     async def classify_failure(self, transaction_data: dict[str, Any]) -> dict[str, Any]:
@@ -104,62 +111,83 @@ class ClassifierService:
             "raw_response": None
         }
 
-        messages = [{"role": "user", "content": user_message}]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
         
+        primary_model = getattr(settings, "GROQ_MODEL", None) or "qwen/qwen3.8-27b"
+        candidate_models = [primary_model, "groq/compound-mini", "groq/compound"]
+
         for attempt in range(2):
-            try:
-                response = await self.client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=256,
-                    system=system_prompt,
-                    messages=messages,
-                )
-                
-                response_text = response.content[0].text
-                
+            for model_name in candidate_models:
                 try:
-                    parsed = json.loads(response_text)
+                    response = await self.client.chat.completions.create(
+                        model=model_name,
+                        messages=messages,
+                        max_tokens=256,
+                        temperature=0.1,
+                    )
                     
-                    predicted_reason = parsed.get("predicted_reason")
-                    confidence_score = parsed.get("confidence_score")
-                    reasoning = parsed.get("reasoning", "")
+                    response_text = response.choices[0].message.content or ""
                     
-                    if predicted_reason not in self.VALID_REASONS:
-                        raise ValueError(f"Invalid reason: {predicted_reason}")
+                    try:
+                        # Strip markdown code blocks if the model wrapped JSON
+                        cleaned_text = response_text.strip()
+                        if cleaned_text.startswith("```"):
+                            parts = cleaned_text.split("```")
+                            if len(parts) >= 2:
+                                cleaned_text = parts[1]
+                                if cleaned_text.startswith("json"):
+                                    cleaned_text = cleaned_text[4:]
+                                cleaned_text = cleaned_text.strip()
+
+                        parsed = json.loads(cleaned_text)
                         
-                    if not isinstance(confidence_score, (int, float)) or not (0.0 <= confidence_score <= 1.0):
-                        raise ValueError(f"Invalid confidence: {confidence_score}")
+                        predicted_reason = parsed.get("predicted_reason")
+                        confidence_score = parsed.get("confidence_score")
+                        reasoning = parsed.get("reasoning", "")
                         
-                    return {
-                        "predicted_reason": predicted_reason,
-                        "confidence_score": float(confidence_score),
-                        "reasoning": str(reasoning),
-                        "raw_response": response.model_dump()
-                    }
-                    
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"JSON parsing/validation failed on attempt {attempt+1}: {e}")
-                    if attempt == 0:
-                        messages.append({"role": "assistant", "content": response_text})
-                        messages.append({
-                            "role": "user", 
-                            "content": "Your previous response was not valid JSON. Respond with ONLY a JSON object, no other text."
-                        })
-                    else:
-                        logger.error("Failed to get valid JSON from LLM after retry.")
-                        return fallback
+                        if predicted_reason not in self.VALID_REASONS:
+                            raise ValueError(f"Invalid reason: {predicted_reason}")
+                            
+                        if not isinstance(confidence_score, (int, float)) or not (0.0 <= confidence_score <= 1.0):
+                            raise ValueError(f"Invalid confidence: {confidence_score}")
+                            
+                        logger.info(
+                            f"🤖 Groq [{model_name}] classified: reason={predicted_reason}, "
+                            f"confidence={confidence_score:.2f}, reasoning='{reasoning}'"
+                        )
+                        return {
+                            "predicted_reason": predicted_reason,
+                            "confidence_score": float(confidence_score),
+                            "reasoning": str(reasoning),
+                            "raw_response": response.model_dump()
+                        }
                         
-            except (
-                anthropic.APIError, 
-                anthropic.APITimeoutError, 
-                anthropic.RateLimitError, 
-                anthropic.APIConnectionError
-            ) as e:
-                logger.error(f"Anthropic API error: {e}")
-                return fallback
-            except Exception as e:
-                logger.error(f"Unexpected error in classification: {e}")
-                return fallback
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.warning(f"JSON validation failed for {model_name} on attempt {attempt+1}: {e}")
+                        if attempt == 0:
+                            messages.append({"role": "assistant", "content": response_text})
+                            messages.append({
+                                "role": "user", 
+                                "content": "Your previous response was not valid JSON. Respond with ONLY a JSON object, no other text."
+                            })
+                            break  # Retry outer loop with feedback
+                        else:
+                            continue  # Try next candidate model
+                            
+                except (
+                    APITimeoutError,
+                    RateLimitError,
+                    APIConnectionError,
+                    APIStatusError,
+                ) as e:
+                    logger.error(f"Groq API error with model {model_name}: {e}")
+                    continue  # Try next candidate model
+                except Exception as e:
+                    logger.error(f"Unexpected error in classification with {model_name}: {e}")
+                    continue
 
         return fallback
 

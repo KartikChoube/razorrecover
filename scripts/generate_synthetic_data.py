@@ -4,23 +4,29 @@ Generates synthetic transaction data for the RazorRecover project.
 NOTE: This script requires `numpy` and `faker`.
 Install via: pip install numpy faker
 
-Generates 8,000 transactions:
-- 70% success, 30% failed
-- Distributed payment methods and failure reasons
-- Amounts follow a log-normal distribution
-- Inserted into the database using batching
+Generates synthetic transactions (default ~670 total with exactly ~200 failed):
+- ~70% success (~470), ~30% failed (~200)
+- Proportional failure reason distribution:
+    - insufficient_funds: 30% (~60)
+    - bank_error: 20% (~40)
+    - expired_card: 20% (~40)
+    - auth_failure: 15% (~30)
+    - unknown: 15% (~30)
+- Distributed payment methods and log-normal amounts
+- Configurable via CLI arguments (--total, --failed, --clear)
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import random
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from decimal import Decimal
+from pathlib import Path
 
 # Add project root to sys.path to find the app package
 project_root = Path(__file__).resolve().parent.parent
@@ -40,32 +46,36 @@ except ImportError:
     print("Please install it using: pip install faker")
     sys.exit(1)
 
-from sqlalchemy import select, func
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
+
 from app.database import AsyncSessionLocal
-from app.models import Transaction
-from app.models.enums import TransactionStatus, PaymentMethod, FailureReasonType
+from app.models import (
+    AuditLog,
+    FailureClassification,
+    Intervention,
+    RecoveryMetrics,
+    Transaction,
+)
+from app.models.enums import FailureReasonType, PaymentMethod, TransactionStatus
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
-# Constants
-TOTAL_TRANSACTIONS = 8000
-BATCH_SIZE = 500
+# Defaults
+DEFAULT_TOTAL_TRANSACTIONS = 670
+DEFAULT_FAILED_TRANSACTIONS = 200
+BATCH_SIZE = 200
 MERCHANT_COUNT = 50
-CUSTOMER_COUNT = 3000
+CUSTOMER_COUNT = 500
 
-# Probabilities
-SUCCESS_RATE = 0.70
-FAILURE_RATE = 0.30
-
-# Failure breakdowns
+# Failure breakdowns (proportions of failed transactions)
 FAILURE_BREAKDOWN = {
-    FailureReasonType.INSUFFICIENT_FUNDS: 0.30,
-    FailureReasonType.BANK_ERROR: 0.20,
-    FailureReasonType.EXPIRED_CARD: 0.20,
-    FailureReasonType.AUTH_FAILURE: 0.15,
-    FailureReasonType.UNKNOWN: 0.15,
+    FailureReasonType.INSUFFICIENT_FUNDS: 0.30,  # 30% of 200 = 60
+    FailureReasonType.BANK_ERROR: 0.20,          # 20% of 200 = 40
+    FailureReasonType.EXPIRED_CARD: 0.20,        # 20% of 200 = 40
+    FailureReasonType.AUTH_FAILURE: 0.15,        # 15% of 200 = 30
+    FailureReasonType.UNKNOWN: 0.15,             # 15% of 200 = 30
 }
 
 # Payment method breakdowns
@@ -76,75 +86,148 @@ PAYMENT_METHOD_BREAKDOWN = {
     PaymentMethod.WALLET: 0.05,
 }
 
+
 def generate_random_date(fake: Faker) -> datetime:
     """Generate a random date in the last 30 days, clustered 10am-10pm IST."""
     now = datetime.now(timezone.utc)
     start_date = now - timedelta(days=30)
-    
+
     # Random date within last 30 days
     random_days = random.uniform(0, 30)
     base_date = start_date + timedelta(days=random_days)
-    
+
     # 80% chance between 10am and 10pm IST
     if random.random() < 0.8:
-        # Generate hour between 10 and 21 (inclusive)
         hour = random.randint(10, 21)
     else:
-        # Generate hour outside 10-21
         hour = random.choice(list(range(0, 10)) + list(range(22, 24)))
-        
+
     minute = random.randint(0, 59)
     second = random.randint(0, 59)
-    
+
     # Set time for IST, converting back to UTC for database storage
     ist_time = base_date.replace(hour=hour, minute=minute, second=second)
     utc_time = ist_time - timedelta(hours=5, minutes=30)
-    
+
     return utc_time
 
-async def check_idempotency(session) -> bool:
+
+async def clear_existing_data(session) -> None:
+    """Wipe existing transaction and recovery records before fresh generation."""
+    logger.info("🗑️  Clearing existing data from database tables...")
+    try:
+        # PostgreSQL fast truncate with cascade
+        await session.execute(
+            text(
+                "TRUNCATE TABLE transactions, failure_classifications, interventions, audit_log, recovery_metrics CASCADE;"
+            )
+        )
+        await session.commit()
+        logger.info("✅ Database tables truncated successfully.")
+    except Exception as exc:
+        await session.rollback()
+        logger.info(f"ℹ️  TRUNCATE CASCADE failed ({exc}). Falling back to table delete statements...")
+        # Fallback in reverse dependency order
+        await session.execute(delete(RecoveryMetrics))
+        await session.execute(delete(AuditLog))
+        await session.execute(delete(Intervention))
+        await session.execute(delete(FailureClassification))
+        await session.execute(delete(Transaction))
+        await session.commit()
+        logger.info("✅ All records deleted successfully.")
+
+
+async def check_idempotency(session, total_expected: int) -> bool:
     """Check if data already exists to avoid duplicate generation."""
     try:
         result = await session.execute(select(func.count(Transaction.transaction_id)))
         count = result.scalar() or 0
-        if count >= TOTAL_TRANSACTIONS:
-            logger.warning(f"⚠️ Database already has {count} transactions. Exiting.")
+        if count >= total_expected:
+            logger.warning(
+                f"⚠️ Database already has {count} transactions (threshold: {total_expected}). Exiting.\n"
+                f"   To wipe and regenerate fresh data, run:\n"
+                f"   python scripts/generate_synthetic_data.py --clear"
+            )
             return False
         elif count > 0:
-            logger.warning(f"⚠️ Database has {count} transactions. Exiting to avoid partial state.")
+            logger.warning(
+                f"⚠️ Database currently has {count} transactions. Exiting to avoid partial state.\n"
+                f"   To wipe and regenerate fresh data, run:\n"
+                f"   python scripts/generate_synthetic_data.py --clear"
+            )
             return False
         return True
     except SQLAlchemyError as e:
         logger.error(f"❌ Database error checking idempotency: {e}")
         return False
 
+
 def print_summary(transactions: list[Transaction]):
     """Prints a formatted summary table of generated transactions."""
     total = len(transactions)
     success_count = sum(1 for t in transactions if t.status == TransactionStatus.SUCCESS)
     failed_count = sum(1 for t in transactions if t.status == TransactionStatus.FAILED)
-    
+
     failed_txns = [t for t in transactions if t.status == TransactionStatus.FAILED]
-    
-    # Note: failure_reason might be enum or string depending on exact model mapping. 
-    # Using enum values to match.
-    insufficient = sum(1 for t in failed_txns if t.failure_reason in (FailureReasonType.INSUFFICIENT_FUNDS, FailureReasonType.INSUFFICIENT_FUNDS.value))
-    bank_err = sum(1 for t in failed_txns if t.failure_reason in (FailureReasonType.BANK_ERROR, FailureReasonType.BANK_ERROR.value))
-    expired = sum(1 for t in failed_txns if t.failure_reason in (FailureReasonType.EXPIRED_CARD, FailureReasonType.EXPIRED_CARD.value))
-    auth_fail = sum(1 for t in failed_txns if t.failure_reason in (FailureReasonType.AUTH_FAILURE, FailureReasonType.AUTH_FAILURE.value))
-    unknown = sum(1 for t in failed_txns if t.failure_reason in (FailureReasonType.UNKNOWN, FailureReasonType.UNKNOWN.value))
-    
-    upi = sum(1 for t in transactions if t.payment_method in (PaymentMethod.UPI, PaymentMethod.UPI.value))
-    card = sum(1 for t in transactions if t.payment_method in (PaymentMethod.CARD, PaymentMethod.CARD.value))
-    netbanking = sum(1 for t in transactions if t.payment_method in (PaymentMethod.NETBANKING, PaymentMethod.NETBANKING.value))
-    wallet = sum(1 for t in transactions if t.payment_method in (PaymentMethod.WALLET, PaymentMethod.WALLET.value))
-    
+
+    insufficient = sum(
+        1
+        for t in failed_txns
+        if t.failure_reason
+        in (FailureReasonType.INSUFFICIENT_FUNDS, FailureReasonType.INSUFFICIENT_FUNDS.value)
+    )
+    bank_err = sum(
+        1
+        for t in failed_txns
+        if t.failure_reason
+        in (FailureReasonType.BANK_ERROR, FailureReasonType.BANK_ERROR.value)
+    )
+    expired = sum(
+        1
+        for t in failed_txns
+        if t.failure_reason
+        in (FailureReasonType.EXPIRED_CARD, FailureReasonType.EXPIRED_CARD.value)
+    )
+    auth_fail = sum(
+        1
+        for t in failed_txns
+        if t.failure_reason
+        in (FailureReasonType.AUTH_FAILURE, FailureReasonType.AUTH_FAILURE.value)
+    )
+    unknown = sum(
+        1
+        for t in failed_txns
+        if t.failure_reason
+        in (FailureReasonType.UNKNOWN, FailureReasonType.UNKNOWN.value)
+    )
+
+    upi = sum(
+        1
+        for t in transactions
+        if t.payment_method in (PaymentMethod.UPI, PaymentMethod.UPI.value)
+    )
+    card = sum(
+        1
+        for t in transactions
+        if t.payment_method in (PaymentMethod.CARD, PaymentMethod.CARD.value)
+    )
+    netbanking = sum(
+        1
+        for t in transactions
+        if t.payment_method in (PaymentMethod.NETBANKING, PaymentMethod.NETBANKING.value)
+    )
+    wallet = sum(
+        1
+        for t in transactions
+        if t.payment_method in (PaymentMethod.WALLET, PaymentMethod.WALLET.value)
+    )
+
     amounts = [float(t.amount) for t in transactions]
     min_amt = min(amounts)
     max_amt = max(amounts)
     avg_amt = sum(amounts) / total
     revenue_at_risk = sum(float(t.amount) for t in failed_txns)
-    
+
     print("\n╔══════════════════════════════════════════════════════════════╗")
     print("║              RazorRecover — Synthetic Data Summary           ║")
     print("╠══════════════════════════════════════════════════════════════╣")
@@ -175,72 +258,82 @@ def print_summary(transactions: list[Transaction]):
     print("╚══════════════════════════════════════════════════════════════╝")
 
 
-async def main() -> None:
+async def generate_data(
+    total_transactions: int = DEFAULT_TOTAL_TRANSACTIONS,
+    num_failed: int = DEFAULT_FAILED_TRANSACTIONS,
+    clear: bool = False,
+) -> None:
     """Generate and insert synthetic transaction data."""
-    # Seed random generators
+    if num_failed > total_transactions:
+        raise ValueError(f"Failed count ({num_failed}) cannot exceed total ({total_transactions})")
+
+    # Seed random generators for reproducible generation
     random.seed(42)
     np.random.seed(42)
     Faker.seed(42)
     fake = Faker()
 
     async with AsyncSessionLocal() as session:
-        if not await check_idempotency(session):
+        if clear:
+            await clear_existing_data(session)
+
+        if not await check_idempotency(session, total_expected=total_transactions):
             return
 
-        logger.info("🔧 Starting synthetic data generation...")
-        
+        logger.info(
+            f"🔧 Generating {total_transactions} transactions "
+            f"(target: {total_transactions - num_failed} success, {num_failed} failed)..."
+        )
+
         # Pre-generate UUID pools
         merchant_ids = [uuid.uuid4() for _ in range(MERCHANT_COUNT)]
         customer_ids = [uuid.uuid4() for _ in range(CUSTOMER_COUNT)]
-        
-        # Generate target counts
-        num_success = int(TOTAL_TRANSACTIONS * SUCCESS_RATE)
-        num_failed = int(TOTAL_TRANSACTIONS * FAILURE_RATE)
-        
-        # Generate exact failure breakdown
-        failed_reasons = (
-            [FailureReasonType.INSUFFICIENT_FUNDS.value] * int(num_failed * FAILURE_BREAKDOWN[FailureReasonType.INSUFFICIENT_FUNDS]) +
-            [FailureReasonType.BANK_ERROR.value] * int(num_failed * FAILURE_BREAKDOWN[FailureReasonType.BANK_ERROR]) +
-            [FailureReasonType.EXPIRED_CARD.value] * int(num_failed * FAILURE_BREAKDOWN[FailureReasonType.EXPIRED_CARD]) +
-            [FailureReasonType.AUTH_FAILURE.value] * int(num_failed * FAILURE_BREAKDOWN[FailureReasonType.AUTH_FAILURE]) +
-            [FailureReasonType.UNKNOWN.value] * int(num_failed * FAILURE_BREAKDOWN[FailureReasonType.UNKNOWN])
-        )
-        
-        # Adjust for rounding errors
+
+        num_success = total_transactions - num_failed
+
+        # Generate exact failure breakdown matching proportions
+        failed_reasons = []
+        for reason_type, prop in FAILURE_BREAKDOWN.items():
+            count = int(round(num_failed * prop))
+            failed_reasons.extend([reason_type.value] * count)
+
+        # Adjust for rounding to hit exact num_failed
         while len(failed_reasons) < num_failed:
             failed_reasons.append(FailureReasonType.UNKNOWN.value)
+        while len(failed_reasons) > num_failed:
+            failed_reasons.pop()
         random.shuffle(failed_reasons)
-        
+
         # Generate exact payment method breakdown
-        payment_methods = (
-            [PaymentMethod.UPI] * int(TOTAL_TRANSACTIONS * PAYMENT_METHOD_BREAKDOWN[PaymentMethod.UPI]) +
-            [PaymentMethod.CARD] * int(TOTAL_TRANSACTIONS * PAYMENT_METHOD_BREAKDOWN[PaymentMethod.CARD]) +
-            [PaymentMethod.NETBANKING] * int(TOTAL_TRANSACTIONS * PAYMENT_METHOD_BREAKDOWN[PaymentMethod.NETBANKING]) +
-            [PaymentMethod.WALLET] * int(TOTAL_TRANSACTIONS * PAYMENT_METHOD_BREAKDOWN[PaymentMethod.WALLET])
-        )
-        
-        while len(payment_methods) < TOTAL_TRANSACTIONS:
+        payment_methods = []
+        for method, prop in PAYMENT_METHOD_BREAKDOWN.items():
+            count = int(round(total_transactions * prop))
+            payment_methods.extend([method] * count)
+
+        while len(payment_methods) < total_transactions:
             payment_methods.append(PaymentMethod.UPI)
+        while len(payment_methods) > total_transactions:
+            payment_methods.pop()
         random.shuffle(payment_methods)
-        
-        # Generate amounts (log-normal)
-        amounts = np.random.lognormal(mean=6.5, sigma=1.0, size=TOTAL_TRANSACTIONS)
+
+        # Generate log-normal amounts
+        amounts = np.random.lognormal(mean=6.5, sigma=1.0, size=total_transactions)
         amounts = np.clip(amounts, 100.0, 50000.0)
-        
+
         transactions = []
         failure_idx = 0
-        
-        for i in range(TOTAL_TRANSACTIONS):
+
+        for i in range(total_transactions):
             is_success = i < num_success
             status = TransactionStatus.SUCCESS if is_success else TransactionStatus.FAILED
             failure_reason = None
             if not is_success:
                 failure_reason = failed_reasons[failure_idx]
                 failure_idx += 1
-                
+
             amount = Decimal(str(round(amounts[i], 2)))
             created_at = generate_random_date(fake)
-            
+
             txn = Transaction(
                 transaction_id=uuid.uuid4(),
                 merchant_id=random.choice(merchant_ids),
@@ -251,28 +344,61 @@ async def main() -> None:
                 payment_method=payment_methods[i],
                 failure_reason=failure_reason,
                 created_at=created_at,
-                updated_at=created_at
+                updated_at=created_at,
             )
             transactions.append(txn)
-        
-        # Shuffle transactions so successes and failures are mixed
+
+        # Shuffle so successes and failures are interspersed chronologically
         random.shuffle(transactions)
-        
+
         # Batch insert
         try:
-            total_batches = (TOTAL_TRANSACTIONS + BATCH_SIZE - 1) // BATCH_SIZE
-            for i in range(0, TOTAL_TRANSACTIONS, BATCH_SIZE):
-                batch = transactions[i:i + BATCH_SIZE]
+            total_batches = (total_transactions + BATCH_SIZE - 1) // BATCH_SIZE
+            for i in range(0, total_transactions, BATCH_SIZE):
+                batch = transactions[i : i + BATCH_SIZE]
                 session.add_all(batch)
                 await session.commit()
                 batch_num = i // BATCH_SIZE + 1
-                logger.info(f"Generating transactions... [batch {batch_num}/{total_batches}]")
-            
+                logger.info(f"Saving transactions... [batch {batch_num}/{total_batches}]")
+
             print_summary(transactions)
-            
+
         except SQLAlchemyError as e:
             await session.rollback()
             logger.error(f"❌ Failed to insert synthetic data: {e}")
 
+
+def parse_args():
+    """Parse command line options."""
+    parser = argparse.ArgumentParser(
+        description="Generate synthetic transaction data for RazorRecover."
+    )
+    parser.add_argument(
+        "--total",
+        type=int,
+        default=DEFAULT_TOTAL_TRANSACTIONS,
+        help=f"Total transactions to generate (default: {DEFAULT_TOTAL_TRANSACTIONS})",
+    )
+    parser.add_argument(
+        "--failed",
+        type=int,
+        default=DEFAULT_FAILED_TRANSACTIONS,
+        help=f"Number of failed transactions (default: {DEFAULT_FAILED_TRANSACTIONS})",
+    )
+    parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="Clear existing database tables before generating fresh transactions",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    args = parse_args()
+    asyncio.run(
+        generate_data(
+            total_transactions=args.total,
+            num_failed=args.failed,
+            clear=args.clear,
+        )
+    )
